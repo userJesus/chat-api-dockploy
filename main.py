@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from typing import List, Dict
 import json
 from datetime import datetime
 
@@ -8,7 +8,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Pode restringir para ["https://chat.nicoacademy.com"] se quiser
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -16,85 +16,123 @@ app.add_middleware(
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        # Agora armazenamos ID -> WebSocket para saber quem é quem
+        self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[client_id] = websocket
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
 
     async def broadcast(self, message: dict):
-        # Envia o dicionário como JSON para todos
+        # Envia para todos
         encoded_message = json.dumps(message)
-        for connection in self.active_connections:
+        for connection in self.active_connections.values():
             try:
                 await connection.send_text(encoded_message)
             except:
-                self.disconnect(connection)
+                pass # Se falhar, o disconnect lida depois
+
+    def get_all_users(self):
+        return list(self.active_connections.keys())
 
 manager = ConnectionManager()
 
 @app.get("/")
 def read_root():
-    return {"status": "Chat API 2.0 is running"}
+    return {"status": "Chat API with Video Relay is running"}
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await manager.connect(websocket)
+    user_id = f"Guest-{client_id}"
+    await manager.connect(websocket, user_id)
     
-    # Avisa que entrou
+    # 1. Avisa a todos que entrou (Sistema)
     await manager.broadcast({
         "type": "system",
         "user": "Sistema",
-        "content": f"Guest-{client_id} entrou na sala.",
+        "content": f"{user_id} entrou na sala.",
         "timestamp": datetime.now().isoformat()
     })
     
     try:
         while True:
-            # Recebe os dados brutos (agora esperamos um JSON string do front)
             raw_data = await websocket.receive_text()
             
             try:
-                # Tenta processar como JSON
                 payload = json.loads(raw_data)
                 
-                # Prepara o pacote para enviar para todos
+                # Base da resposta
                 response = {
-                    "user": f"Guest-{client_id}",
+                    "user": user_id,
                     "timestamp": datetime.now().isoformat()
                 }
 
-                # Se for mensagem de texto
-                if payload.get("type") == "message":
+                msg_type = payload.get("type")
+
+                # --- Lógica de Chat ---
+                if msg_type == "message":
                     response["type"] = "message"
                     response["content"] = payload.get("content")
+                    await manager.broadcast(response)
                 
-                # Se for aviso de digitando
-                elif payload.get("type") == "typing":
+                elif msg_type == "typing":
                     response["type"] = "typing"
                     response["is_typing"] = payload.get("is_typing")
+                    await manager.broadcast(response)
+
+                # --- Lógica de Vídeo (O PULO DO GATO) ---
                 
-                # Envia para todos
-                await manager.broadcast(response)
+                elif msg_type == "join-room":
+                    # Quando alguém entra no vídeo, enviamos a lista de quem já está lá SÓ PRA ELE
+                    active_users = manager.get_all_users()
+                    # Responde apenas para quem pediu (unicast simulado via socket atual)
+                    await websocket.send_text(json.dumps({
+                        "type": "all-users",
+                        "users": active_users
+                    }))
+                    # Avisa os outros que ele chegou
+                    await manager.broadcast({
+                        "type": "user-joined",
+                        "id": user_id
+                    })
+
+                elif msg_type == "signal":
+                    # Repassa o sinal WebRTC (Sinalização)
+                    # O payload tem { type: "signal", target: "Guest-XYZ", signal: {...} }
+                    response["type"] = "signal"
+                    response["target"] = payload.get("target") # CRÍTICO: Repassar o alvo
+                    response["signal"] = payload.get("signal")
+                    response["from"] = user_id # Quem está mandando
+                    await manager.broadcast(response)
+
+                elif msg_type == "leave-room":
+                    await manager.broadcast({
+                        "type": "user-left-video",
+                        "id": user_id
+                    })
+                
+                else:
+                    # Fallback: Se não conhecemos o tipo, repassamos tudo (segurança)
+                    response.update(payload)
+                    await manager.broadcast(response)
 
             except json.JSONDecodeError:
-                # Fallback: Se o front mandar texto puro (versão antiga), trata como mensagem
-                await manager.broadcast({
-                    "type": "message",
-                    "user": f"Guest-{client_id}",
-                    "content": raw_data,
-                    "timestamp": datetime.now().isoformat()
-                })
+                pass
             
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(user_id)
         await manager.broadcast({
             "type": "system",
             "user": "Sistema",
-            "content": f"Guest-{client_id} saiu da sala.",
+            "content": f"{user_id} saiu da sala.",
             "timestamp": datetime.now().isoformat()
+        })
+        # Avisa para remover o vídeo também
+        await manager.broadcast({
+            "type": "user-left-video",
+            "id": user_id
         })
