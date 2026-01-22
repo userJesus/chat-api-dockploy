@@ -3,63 +3,71 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import json
 from datetime import datetime
+import sys
+
+# Função auxiliar para garantir que o log saia na hora no Docker
+def log(msg):
+    print(f"[LOG] {msg}", flush=True)
 
 app = FastAPI()
 
-# Configuração de CORS (Permite que o front-end no v0 conecte aqui)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Em produção, idealmente restrinja para o domínio do seu front
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Gerenciador de Conexões (Na memória)
 class ConnectionManager:
     def __init__(self):
-        # Lista de sockets ativos
         self.active_connections: List[WebSocket] = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        log(f"Conexão aceita. Total ativos: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            log(f"Conexão removida. Total ativos: {len(self.active_connections)}")
 
     async def broadcast(self, message: dict):
-        # Envia a mensagem para todos os conectados
+        log(f"Enviando broadcast: {message}")
         for connection in self.active_connections:
             try:
                 await connection.send_text(json.dumps(message))
-            except:
-                # Se falhar ao enviar, assume que caiu e remove
+            except Exception as e:
+                log(f"Erro ao enviar broadcast: {e}")
                 self.disconnect(connection)
 
 manager = ConnectionManager()
 
+# --- Endpoint de Saúde (Teste HTTP) ---
 @app.get("/")
 def read_root():
-    return {"status": "Chat API is running"}
+    log("Recebido GET na raiz /")
+    return {"status": "Chat API is running", "timestamp": datetime.now().isoformat()}
 
+# --- Endpoint do WebSocket ---
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await manager.connect(websocket)
-    
-    # Notifica que alguém entrou
-    await manager.broadcast({
-        "user": "Sistema",
-        "message": f"Guest-{client_id} entrou na sala.",
-        "timestamp": datetime.now().isoformat()
-    })
+    log(f"Nova tentativa de conexão WebSocket de: {client_id}")
     
     try:
+        await manager.connect(websocket)
+        
+        await manager.broadcast({
+            "user": "Sistema",
+            "message": f"Guest-{client_id} entrou.",
+            "timestamp": datetime.now().isoformat()
+        })
+        
         while True:
-            # Espera receber mensagem do cliente
             data = await websocket.receive_text()
+            log(f"Mensagem recebida de {client_id}: {data}")
             
-            # Reenvia para todos (Broadcast)
             await manager.broadcast({
                 "user": f"Guest-{client_id}",
                 "message": data,
@@ -67,9 +75,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             })
             
     except WebSocketDisconnect:
+        log(f"Cliente {client_id} desconectou (WebSocketDisconnect)")
         manager.disconnect(websocket)
         await manager.broadcast({
             "user": "Sistema",
-            "message": f"Guest-{client_id} saiu da sala.",
+            "message": f"Guest-{client_id} saiu.",
             "timestamp": datetime.now().isoformat()
         })
+    except Exception as e:
+        log(f"Erro CRÍTICO na conexão de {client_id}: {str(e)}")
+        manager.disconnect(websocket)
